@@ -1,0 +1,231 @@
+#!/bin/bash
+
+PROGNAME=$(basename $0)
+VERSION="0.1.0"
+Errmsg="[1;31m[error][0m"
+Sccmsg="[1;32m[success][0m"
+Modidate="2024-08-22"
+incmd="$0 $*"
+
+
+# {{{ usage
+read -r -d '' usage <<EOF
+[1;35m### $PROGNAME ver $VERSION ($Modidate) ###[0m
+
+[1;32m[description][0m
+$PROGNAME - protein family alignments hundler.
+$PROGNAME receives multiple MSAs of protein families, and ...
+(1) builds HMM DBs for HMMER and HHblits
+(2) generates position converter of included proteins, alignments, HMMER hmms, and HH-suite hmms
+(3) inspects each MSA by making a weblogo and similarity-based heatmap
+
+[1;32m[usage][0m
+$ $PROGNAME [options] -i <input MSA files> -o <output dir>
+
+[1;32m[dependencies][0m
+- ruby (ver >= 3.0) 
+- GNU parallel
+
+[1;32m[options][0m
+  (general)
+    -h, --help
+    -v, --version
+
+  (file/directory)
+    -i, --input      [file(s)] (required)  -- protein MSA file(s) (nucleotide or protein, the type is automatically detected)
+                                              Multiple genome files can be specfied with wildcard (e.g., 'dir/*.fa', quote required) or comma separated values without space (e.g., A.fa,B.fa).
+                                              File names should be unique (used as output labels).
+    -o, --outdir     [path] (required)     -- output directory (should not exist unless '--overwrite' is specified)
+    --overwrite             (default: off) -- overwrite output directory
+
+  (hhblits)
+    -e, --evalue     [num] (default: 1e-5) -- evalue threshold of hmmsearch
+        --iter       [num] (default: 2)    -- number of iteration for hhblits
+
+  (computation)
+    -n, --ncpus      [int] (default: 1)    -- num CPUs to use
+
+[1;32m[output files / directories][0m
+  result/heatmap/   --- similarity-based heatmap (CPAP)
+  result/cluster/   --- mmseqs cluster
+  result/seqlogo/   --- weblogo and skylign
+  result/hmm/       --- hmmbuild
+  result/hmm_all/   --- hmmbuild (concatenated hmm)
+  result/hhdb/      --- hhdb (db for hhblits)
+  result/hhdb_all/  --- hhdb (db for hhblits) (cocatenated db)
+  result/hhm/       --- hhm (hmm for hhblits)
+  result/hmmsearch/ --- self hhblits result (by using hhm and hhdb)
+  result/hhblits/   --- self hhblits result (by using hhm and hhdb)
+EOF
+# }}} usage
+
+
+# {{{ parse command line
+for OPT in "$@"
+do
+	case "$OPT" in
+		'-h'|'--help' )
+			echo "$usage"
+			exit 1
+			;;
+		'-v'|'--version' )
+			echo $VERSION
+			exit 1
+			;;
+		'-i'|'--input' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2; exit 1
+			fi
+			input="$2"
+			shift 2
+			;;
+		'-o'|'--outdir' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2; exit 1
+			fi
+			outdir="$2"
+			shift 2
+			;;
+		'--overwrite' )
+			overwrite=true
+			shift 1
+			;;
+		'-e'|'--evalue' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2; exit 1
+			fi
+			evalue="$2"
+			shift 2
+			;;
+		'--iter' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2; exit 1
+			fi
+			iter="$2"
+			shift 2
+			;;
+		'-n'|'--ncpus' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2; exit 1
+			fi
+			ncpus="$2"
+			shift 2
+			;;
+		'--'|'-' )
+			shift 1
+			params+=( "$@" )
+			break
+			;;
+		-*)
+			echo "$Errmsg illegal option -- '$(echo $1 | sed 's/^-*//')'" 1>&2; exit 1
+			;;
+		*)
+			if [[ ! -z "$1" ]] && [[ ! "$1" =~ ^-+ ]] ; then
+				echo "$Errmsg unparsable argument ($1)." 1>&2; echo "        Note: do not forget quotation marks to use wildcards" 1>&2; exit 1
+			fi
+			;;
+	esac
+done
+
+## default
+evalue="${evalue:-1e-5}"
+iter="${iter:-2}"
+
+re='^[0-9]+$'
+if   [[ ! -n "$input" ]] ; then
+	echo "$Errmsg  -i, --input <fasta file(s)> should be given." 1>&2; echo "         execute '$PROGNAME -h' for usage" 1>&2; exit 1
+elif [[ ! -n "$outdir" ]] ; then
+	echo "$Errmsg  -o, --outdir should be given." 1>&2; echo "         execute '$PROGNAME -h' for usage" 1>&2; exit 1
+elif [[   -d "$outdir" && -z "$overwrite" ]] ; then
+	echo "$Errmsg  -o, --outdir $outdir already exists. Use --overwrite to overwrite it. " 1>&2; echo "         execute '$PROGNAME -h' for usage" 1>&2; exit 1
+elif [[ ! -d "$outdir" &&  -e "$outdir" ]] ; then
+	echo "$Errmsg  -o, --outdir $outdir already exists and not directory (is it a file?). " 1>&2; echo "         execute '$PROGNAME -h' for usage" 1>&2; exit 1
+elif [[ ! $ncpus =~ $re ]] ; then
+	echo "$Errmsg  --ncpus '$ncpus' is not an integer" 1>&2; echo "         execute '$PROGNAME -h' for usage" 1>&2; exit 1
+fi
+
+if [[ -d "$outdir" && "$overwrite" = "true" ]] ; then
+	outdir_exist=true
+fi
+
+### rakefile/logdir
+pushd `dirname $0` > /dev/null
+scrdir=`pwd -P`
+popd > /dev/null
+jobname=`basename $0`
+rakefile=$scrdir/$jobname.rake
+
+logdir=$outdir/log
+mkdir -p $logdir
+startTime=$(LC_ALL=C date +"%Y-%m-%d_%H:%M:%S")
+flog=$logdir/$startTime.$jobname.log
+# }}} parse command line
+
+
+# {{{ check dependencies
+command -v ruby >/dev/null 2>&1 || { echo >&2 "$Errmsg ruby is not available.  Aborting."; exit 1; }
+
+### check ruby version
+ST=`ruby -e 'print RUBY_VERSION.to_f >= 3.0 ? 0 : 1'`
+if [ $ST -ne 0 ]; then 
+	echo >&2 "$Errmsg ruby (version >=3.0) is required.  Aborting."; exit 1;
+fi
+
+### check availablity of GNU parallel
+# if [ "$ncpus" -gt 1 ]; then 
+command -v parallel >/dev/null 2>&1 || { echo >&2 "$Errmsg parallel (GNU parallel) is not available.  Aborting."; exit 1; }
+# fi
+# }}} check dependencies
+
+
+# {{{ after run function
+function after_run(){
+  endTime=$(LC_ALL=C date +"%Y-%m-%d %H:%M:%S %z")
+
+  if [[ $1 -gt 0 ]] ; then
+    echo "$Errmsg run failed: $endTime" > "$logdir/$startTime.$jobname.error"
+    echo "$Errmsg process is killed: $endTime" |tee -a "$flog"
+    exit 1
+  else
+    echo "$Sccmsg run finished: $endTime" > "$logdir/$startTime.$jobname.success"
+  fi
+}
+### }}} after run function
+
+
+# {{{ input command
+read -r -d '' incmdlog <<EOF
+
+[1;32m===== command line[0m
+
+$ $incmd
+
+[1;32m===== log file[0m
+
+$flog
+
+[1;32m===== check version: $PROGNAME[0m
+
+$VERSION
+
+EOF
+# }}} input command
+
+
+### main
+
+## write input command
+echo "$incmdlog" |tee -a $flog
+
+## trap Ctrl-C etc...
+trap 'after_run 1' 1 2 3 9 15
+
+## run
+rake -f $rakefile \
+	outdir="$outdir" input="$input" outdir_exist="$outdir_exist" \
+	evalue="$evalue" iter="$iter" \
+	ncpus="$ncpus" \
+	2>&1 |tee -a $flog
+st=$(( ${PIPESTATUS[0]} + ${PIPESTATUS[1]} ))
+after_run $st
+
